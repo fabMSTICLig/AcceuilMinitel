@@ -13,221 +13,230 @@
  *
  */
 
+/* Includes elementaires */
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
 
+/* Include lecture UART */
 #include "msg.h"
 #include "thread.h"
 #include "fmt.h"
+#include "periph/uart.h"
+#include "stdio_uart.h"
 
-#if IS_USED(MODULE_PERIPH_RTC)
+/* Include timers */
 #include "periph/rtc.h"
-#else
 #include "timex.h"
 #include "ztimer.h"
-#endif
-#include "xtimer.h"
 
-#include "net/loramac.h"
-#include "semtech_loramac.h"
-#include "sx127x.h"
-#include "sx127x_netdev.h"
-#include "sx127x_params.h"
-
-/* Messages are sent every 20s to respect the duty cycle on each channel */
-#define PERIOD_S            (20U)
-
-#define SENDER_PRIO         (THREAD_PRIORITY_MAIN - 1)
-static kernel_pid_t sender_pid;
-static char sender_stack[THREAD_STACKSIZE_MAIN / 2];
-
-static semtech_loramac_t loramac;
-static sx127x_t sx127x;
-
-#if !IS_USED(MODULE_PERIPH_RTC)
-static ztimer_t timer;
-#endif
-char *fullmessage = "Decoupe a la laser d'un boitier de carte electronique pour un projet de recherche autour des objects connectes";
-static const char *message = "Decoupe a la laser d'un boitier";//18
-static const char *message2 = " de carte electronique pour un projet de recherc";//18
-static const char *message3 = "he autour des objects connectes";//32
-static const char *user = "Germain L.(LIG)";//16
-#define PAYLOAD_MAX_LEN 50
-uint8_t payload[PAYLOAD_MAX_LEN];
-uint8_t payload2[PAYLOAD_MAX_LEN];
-uint8_t payload3[PAYLOAD_MAX_LEN];
+/* Includes du projet */
+#include "saisie.h"
+#include "UI_minitel.h"
+#include "lora.h"
 
 
-static uint8_t deveui[LORAMAC_DEVEUI_LEN];
-static uint8_t appeui[LORAMAC_APPEUI_LEN];
-static uint8_t appkey[LORAMAC_APPKEY_LEN];
 
-static uint8_t xor(uint8_t * payload, uint16_t length, uint8_t first)
-{
-  uint8_t ret = first;
-  for(uint16_t i=0;i<length;i++)
-  {
-    ret = ret^payload[i];
-  }
-  return ret;
-}
-
-static void _alarm_cb(void *arg)
-{
-    (void) arg;
-    msg_t msg;
-    msg_send(&msg, sender_pid);
-}
-
-static void _prepare_next_alarm(void)
-{
-#if IS_USED(MODULE_PERIPH_RTC)
-    struct tm time;
-    rtc_get_time(&time);
-    /* set initial alarm */
-    time.tm_sec += PERIOD_S;
-    mktime(&time);
-    rtc_set_alarm(&time, _alarm_cb, NULL);
-#else
-    timer.callback = _alarm_cb;
-    ztimer_set(ZTIMER_MSEC, &timer, PERIOD_S * MS_PER_SEC);
-#endif
-}
-
-static void _send_message(void)
-{
-    printf("Sending: %s\n", message);
-    loramac.cnf = LORAMAC_TX_UNCNF;
-    /* Try to send the message */
-        uint8_t ret = semtech_loramac_send(&loramac,
-                                       (uint8_t *)payload, 50);
-    if (ret != SEMTECH_LORAMAC_TX_DONE)  {
-        printf("Cannot send message, ret code: %d\n",ret);
-        return;
-    }
-    xtimer_sleep(7);
-    /* Try to send the message */
-    ret = semtech_loramac_send(&loramac,
-                                       (uint8_t *)payload2, 50);
-    if (ret != SEMTECH_LORAMAC_TX_DONE)  {
-        printf("Cannot send message, ret code: %d\n",ret);
-        return;
-    }
-    printf("Part 2 sent\n");
-    xtimer_sleep(7);
-    ret = semtech_loramac_send(&loramac,
-                                       (uint8_t *)payload3, 33);
-    if (ret != SEMTECH_LORAMAC_TX_DONE)  {
-        printf("Cannot send message, ret code: %d\n",ret);
-        return;
-    }
-    printf("Part 3 sent\n");
+/* Define UART config */
+#define UART  UART_DEV(0)
+#define BAUDRATE (4800U)
 
 
-}
+/* Gestion des caracteres en entree */
+static kernel_pid_t main_thread_pid;
+static void rx_cb(void *uart, uint8_t c);
 
-static void *sender(void *arg)
-{
-    (void)arg;
 
-    msg_t msg;
-    msg_t msg_queue[8];
-    msg_init_queue(msg_queue, 8);
+/* Prototypes */
+void choix_menu_minitel(int *choix_menu);
+uint8_t livre_d_or (char *prenom, char *etablissement, char *message);
 
-    while (1) {
-        msg_receive(&msg);
 
-        /* Trigger the message send */
-        _send_message();
-
-        /* Schedule the next wake-up alarm */
-        _prepare_next_alarm();
-    }
-
-    /* this should never be reached */
-    return NULL;
-}
 
 int main(void)
 {
-    puts("LoRaWAN Class A low-power application");
-    puts("=====================================");
+    /* Init UART : 7 bits, parité pair, stop bit 1 */
+    /* UART0 : PC terminal */
+    uart_init(UART, BAUDRATE, rx_cb, (void *)UART);
+    uart_mode (UART, UART_DATA_BITS_7, UART_PARITY_EVEN, UART_STOP_BITS_1);
+    /* ================================================================ */
 
-    xtimer_sleep(1);
-    payload[0]=1 | 1<<4;
-    payload[2]=127;
-    strcpy((char *)payload+3,user);
-    strcpy((char *)payload+3+strlen(user)+1,message);
+    /* thread pour la reception uart */
+    main_thread_pid = thread_getpid();
+    /* ================================================================ */
+  
+    /* Menu[{livre_dor ; horaire} , {validé ; non validé}] */
+    int choix_menu[2] = {0, 0}; //tableau contenant l'état du menu item[0] choix et curseur et item[1] booléen validé ou non
+    /* ================================================================ */
+
+    /* Init Saisie */
+    char prenom[MAX_USER]; // Variable to store the firstname
+    char etablissement[MAX_ETABLISSEMENT]; // Variable to store the structure
+    char message[MAX_MESSAGE]; // Variable to store the message
+    /* ================================================================ */
+
+    /* Effacement de la page sur le minitel */
+    minitel_cursor_home();
+    minitel_clear_page();
+
+    /* Init Lora */
+    init_lora(); // initialisation du module lora
+    ztimer_sleep(ZTIMER_SEC, 1); // tempo 1s
+    join_procedure(); // procedure de join
+    /* ================================================================ */
     
-    payload[1]=xor((uint8_t*)user+1,strlen(user)-1,user[0]);
-    payload[1]=xor((uint8_t*)fullmessage,strlen(fullmessage),payload[1]);
-    
-    payload2[0]= 2 | 1<<4;
-    payload2[1]=2;
-    strcpy((char *)payload2+2,message2);
-    
-    payload3[0]= 3 | 1<<4;
-    strcpy((char *)payload3+1,message3);
-/*
-    printf("Payload : ");
-    for(uint8_t i=0; i< 50;i++)
+
+
+    /* ======================== Boucle infinie ======================== */
+    while(1)
     {
-      printf("0x%x ", payload[i]);
+        /* affichage accueil */
+        init_affichage();
+        /* permet a l'utilisateur de choisir entre livre d'or et horaire */
+        choix_menu_minitel(choix_menu);
+
+        /* ========== Livre d'or ========== */
+        if(choix_menu[0] == 0)
+        {   
+            livre_d_or (prenom, etablissement, message); // lancement de l'application livre d'or
+        }
+        /* ========== Set Horaire ========== */
+        else if (choix_menu[0] == 1)
+        {
+            // Ajouter l'application une fois realisee
+            printf("SET HORAIRE\r\n");
+        }
+
+        
+        /* Reset du menu */
+        choix_menu[0] = 0;
+        choix_menu[1] = 0;
     }
-    printf("\r\n");
 
-    printf("Payload2 : ");
-    for(uint8_t i=0; i< 50;i++)
-    {
-      printf("0x%x ", payload2[i]);
-    }
-    printf("\r\n");
-    printf("Payload3 : ");
-    for(uint8_t i=0; i< 33;i++)
-    {
-      printf("0x%x ", payload3[i]);
-    }
-    printf("\r\n");
-  */  
-    /* Convert identifiers and application key */
-    fmt_hex_bytes(deveui, CONFIG_LORAMAC_DEV_EUI_DEFAULT);
-    fmt_hex_bytes(appeui, CONFIG_LORAMAC_APP_EUI_DEFAULT);
-    fmt_hex_bytes(appkey, CONFIG_LORAMAC_APP_KEY_DEFAULT);
-
-    /* Initialize the radio driver */
-
-    sx127x_setup(&sx127x, &sx127x_params[0], 0);
-    loramac.netdev = &sx127x.netdev;
-    loramac.netdev->driver = &sx127x_driver;
-
-    /* Initialize the loramac stack */
-    semtech_loramac_init(&loramac);
-    semtech_loramac_set_deveui(&loramac, deveui);
-    semtech_loramac_set_appeui(&loramac, appeui);
-    semtech_loramac_set_appkey(&loramac, appkey);
-
-    /* Use a fast datarate, e.g. BW125/SF7 in EU868 */
-    semtech_loramac_set_dr(&loramac, LORAMAC_DR_5);
-
-    /* Start the Over-The-Air Activation (OTAA) procedure to retrieve the
-     * generated device address and to get the network and application session
-     * keys.
-     */
-    puts("Starting join procedure");
-    if (semtech_loramac_join(&loramac, LORAMAC_JOIN_OTAA) != SEMTECH_LORAMAC_JOIN_SUCCEEDED) {
-        puts("Join procedure failed");
-        return 1;
-    }
-    puts("Join procedure succeeded");
-
-    /* start the sender thread */
-    sender_pid = thread_create(sender_stack, sizeof(sender_stack),
-                               SENDER_PRIO, 0, sender, NULL, "sender");
-
-    /* trigger the first send */
-    msg_t msg;
-    msg_send(&msg, sender_pid);
     return 0;
+}
+
+
+
+/* thread pour la lecture d'un caractere sur la liaison uart */
+static void rx_cb(void *uart, uint8_t c)
+{
+    /* A character was received on an UART interface and triggered
+       this callback through an interruption, we forward it via a message
+       to the main thread. */
+    msg_t msg;
+    msg.type = (int)uart;
+    msg.content.value = (uint32_t)c;
+    msg_send(&msg, main_thread_pid);
+}
+
+
+
+
+/* Permet de faire le choix entre le livre d'or et la partie horaire
+ * Le curseur est deplace avec les touches * et # du clavier. Cette fonction
+ * permet juste a l'utilisateur de faire son choix. Le lancement de l'application
+ * n'est pas fait ici.
+ */
+void choix_menu_minitel(int *choix_menu)
+{
+    printf("\r\n");
+    printf("Bonjour ! Je suis Michel le minitel, que voulez vous faire ?\r\n");
+    printf("(choix avec les touches [*] et [#] puis valider avec ENTREE)\r\n");
+    printf("_____________________________________________________________________________\r\n");
+    printf("\r\n");
+    //printf("     LIVRE D'OR     |     SET HORAIRE\r\n");
+    printf("     LIVRE D'OR     \r\n");
+    set_cursor_menu(0);
+
+    minitel_bip();
+
+    fflush(STDIO_UART_DEV); //on clear le buffer pour les detection touches menu
+   
+
+    /*boucle de menu*/
+    while(1){
+        
+        /* Navigation avec les touches * et # */
+        nav_menu(choix_menu);
+        /* Affichage correspondant a la navigation utilisateur */
+        //set_cursor_menu(choix_menu[0]);
+        //uniquement livre d'or pour l'instant
+        set_cursor_menu(0);
+        printf("%c", 0x0D); // Curseur en debut de ligne
+        fflush(STDIO_UART_DEV);
+
+        if(choix_menu[1] == 1)
+        {
+            /*on clear la page et on sort de la boucle*/
+            minitel_clear_page();
+            minitel_cursor_home();
+            break;
+        }
+
+    }
+}
+
+
+
+/* Application livre d'or
+ *      - Fait la saisie par l'utilisateur du nom, etablissement, message avec
+ *                  # input_user(), input_etablissement() et input()
+ *      - Fait la separation des trames et l'emission lora avec 
+ *                  # send_message() qui appelle trames() et send_lora()
+ */
+uint8_t livre_d_or (char *prenom, char *etablissement, char *message)
+{
+    int len_prenom_etablissment = 0;
+    int len_message = 0;
+    char prenom_etablissement[MAX_USER+MAX_ETABLISSEMENT+1]; // Variable to store the firstname
+
+    /* Chaine a afficher lors de la saisie du message */
+    char chaine_affichage[40];
+    sprintf(chaine_affichage, "MESSAGE (%d caracteres max)", MAX_MESSAGE-1); // Le -1 vient du '\0'
+
+    /* Affichage titre livre d'or*/
+    print_header_livredor();
+    printf("\r\n");
+
+    ztimer_sleep(ZTIMER_SEC, 1); // tempo 1s
+    
+    int ret = 0;
+    /* saisie du nom */
+    ret = input_user(prenom);
+    if(ret==-1) return -1;
+    /* saisie de l'etablissement */
+    ret = input_etablissement(etablissement);
+    if(ret==-1) return -1;
+    /* saisie du message */
+    len_message = input(chaine_affichage, message, MAX_MESSAGE);
+    if(len_message==-1) return -1;
+
+
+    /* Creation de la chaine prenom + etablissement a partir de la saisie */
+    strcpy(prenom_etablissement, prenom);
+    strcat(prenom_etablissement, "(");
+    strcat(prenom_etablissement, etablissement);
+    strcat(prenom_etablissement, ")");
+    /* calcul de la longueur de la chaine */
+    len_prenom_etablissment = strlen(prenom_etablissement);
+
+
+    /* Mise en forme des trames et emission lora */
+    if (send_message (message, len_message, prenom_etablissement, len_prenom_etablissment) != 0) // separation du message en 1, 2 ou 3 trames
+    {
+        printf("Erreur lors de l'emission de la trame. Trop d'essais !\r\n");
+        /* Attente entre deux utilisateur */
+        ztimer_sleep(ZTIMER_SEC, 10); // tempo 10s
+        return -2;
+    }
+    else
+    {
+        printf("\r\nMerci pour votre message ! A bientot !\r\n");    
+        /* Attente entre deux utilisateur */
+        ztimer_sleep(ZTIMER_SEC, 10); // tempo 10s
+        return 0;
+    }
 }
